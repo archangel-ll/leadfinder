@@ -175,7 +175,93 @@ Each milestone is a separate commit set; we review before moving on.
 3. **Single vs. multi-tenant** for v1. Recommendation: single-tenant, RLS-ready.
 4. **Hosting target** (Vercel + Supabase assumed). Confirm.
 
-## 16. Risks
+## 16. Self-improvement loop
+
+The system should get *better at scraping and at lead quality* over time instead of
+silently rotting when a source changes its HTML. Three feedback loops, each with a
+measurable signal and an automatic or semi-automatic correction.
+
+### 16.1 Adapter drift detection → self-healing extraction
+
+- **Baseline per source.** Each adapter records expected field fill-rates and
+  leads-per-run on healthy runs (e.g. "≥90% of leads have a phone").
+- **Detect.** A run that drops below threshold (fewer leads, collapsed fill-rates,
+  parse exceptions) flags the adapter as `degraded` on its `scrape_runs` row.
+- **Heal (LLM-assisted).** On a degraded run, fall back to an **LLM extractor**:
+  pass the raw HTML to **Claude Opus 4.8** (`claude-opus-4-8`) and ask it to return
+  a `RawLead[]` via **structured outputs** (`output_config.format` with a JSON
+  schema — guarantees parseable output). This keeps leads flowing while the
+  deterministic selectors are broken.
+- **Promote.** A successful LLM extraction also asks Claude to emit the CSS/XPath
+  selectors it effectively used. We surface those as a proposed patch to the
+  adapter (human-reviewed before merge) — the deterministic parser is repaired from
+  the model's findings, so the expensive LLM path is temporary, not permanent.
+
+```python
+# fallback extractor — runs only when an adapter is flagged `degraded`
+import anthropic
+client = anthropic.Anthropic()
+
+resp = client.messages.create(
+    model="claude-opus-4-8",
+    max_tokens=16000,
+    thinking={"type": "adaptive"},
+    system=[{                      # stable prompt + schema → cache across pages
+        "type": "text",
+        "text": EXTRACTION_INSTRUCTIONS,
+        "cache_control": {"type": "ephemeral"},
+    }],
+    output_config={"format": {"type": "json_schema", "schema": RAW_LEAD_ARRAY_SCHEMA}},
+    messages=[{"role": "user", "content": page_html}],
+)
+```
+
+Notes: the system prompt + schema are identical across every page, so a
+`cache_control` breakpoint makes repeated extractions ~90% cheaper on the cached
+prefix. For very large pages, switch to `client.messages.stream(...)` +
+`get_final_message()` to avoid HTTP timeouts.
+
+### 16.2 Lead-quality judge → source reprioritization
+
+- An **LLM judge** (also `claude-opus-4-8`, structured output) scores a sample of
+  new leads against a rubric: is this a real business, is contact info plausible,
+  is it in the target category? Returns `{score, reasons}` per lead.
+- Aggregate judge scores per source/category feed a **priority weight** on
+  `sources`. High-quality sources get scraped more; low-quality ones get throttled
+  or flagged for removal.
+- Cheap variant: send judging in a nightly **Batch API** job (50% cost) since it's
+  not latency-sensitive.
+
+### 16.3 Evaluation harness (makes the loop trustworthy)
+
+- **Golden fixtures** per source (recorded HTML + expected `RawLead`).
+- Metrics tracked over time: extraction precision/recall vs. golden, dedup
+  false-merge rate, judge-score distribution.
+- Every adapter change (including LLM-proposed selector patches) is gated on the
+  harness — so "self-improvement" can never silently regress quality.
+
+> Guardrail: the LLM paths are **fallback and evaluation**, never the default
+> hot path. Deterministic parsers run first; the model is invoked only on drift,
+> on a sample for judging, or in batch. This caps cost and keeps runs fast.
+
+## 17. Other recommendations worth folding in
+
+- **Incremental / scheduled crawls.** Track `last_seen_at` per lead; re-scrape on a
+  cadence and only upsert changes rather than re-ingesting everything. Cron via a
+  simple scheduler now; a real queue later.
+- **Page cache + conditional fetch.** Cache fetched HTML (with ETag/Last-Modified)
+  so re-runs and the LLM fallback don't re-hit the source — cheaper and gentler.
+- **Adapter health alerting.** When a source flips to `degraded`, surface it in the
+  Runs UI and optionally notify (the loop in §16.1 is only useful if someone sees it).
+- **Enrichment as a later phase.** Once aggregation is solid, add optional
+  enrichment (email/phone validation, firmographics) behind the same adapter idea.
+- **Idempotency + provenance everywhere.** Every lead already carries `source_url`
+  + `scraped_at`; add a stable `dedup_key` and keep `raw` history so any record is
+  traceable and removable (also satisfies the opt-out guardrail in §4).
+- **Cost guardrails on the LLM loop.** Per-source budget caps, batch judging, and
+  prompt caching keep the self-improvement loop from becoming a cost sink.
+
+## 18. Risks
 
 - **Source layout drift** breaks HTML adapters → mitigated by fixture tests + alerting.
 - **Rate limits / blocking** → conservative throttling, API-first sourcing.
